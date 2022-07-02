@@ -1,0 +1,555 @@
+---
+title: "Relatório - modelagem com os atrasos"
+author: "Raianny"
+date: "25/04/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE,
+                      warning=FALSE,
+                      cache = TRUE,
+                      dev = "png",
+                      dpi = 500)
+```
+
+```{r}
+#Pacotes
+
+library(lubridate)
+library(tidyverse)
+library(tidymodels)
+library(GGally)
+library(vip)
+library(usemodels)
+
+```
+
+# Resumo dos Modelos
+
+
+\begin{center}
+\begin{tabular}{l c c c c c c}
+\hline
+K & RMSE (treino) & RSQ (treino) & RMSE final (treino) & RSQ (treino) & RMSE final (teste) & RSQ (teste)\\
+\hline
+0 & $24096$ & $0.008$ & $21990$ & $0.296$ & $5100$ & $0.037$ \\
+1 & $23304$ & $0.052$ & $19413$ & $0.497$ & $11781$ & $0.035$ \\
+2 & $23300$ & $0.031$ & $17451$ & $0.642$ & $11259$ & $0.009$ \\
+3 & $23603$ & $0.029$ & $21264$ & $0.035$ & $11631$ & $0.075$ \\
+4 & $23774$ & $0.023$ & $20401$ & $0.428$ & $15812$ & $0.119$ \\
+5 & $23684$ & $0.031$ & $19049$ & $0.542$ & $16845$ & $0.191$ \\
+6 & $23432$ & $0.021$ & $17788$ & $0.630$ & $19920$ & $0.315$ \\
+7 & $23849$ & $0.021$ & $21508$ & $0.335$ & $20797$ & $0.000$ \\
+8 & $23035$ & $0.036$ & $17347$ & $0.063$ & $19536$ & $0.059$ \\
+9 & $23278$ & $0.023$ & $18693$ & $0.547$ & $21570$ & $0.144$ \\
+10 & $23592$ & $0.029$ & $20571$ & $0.406$ & $21815$ & $0.058$ \\
+11 & $23199$ & $0.035$ & $18638$ & $0.555$ & $20805$ & $0.013$ \\
+12 & $23159$ & $0.026$ & $17354$ & $0.642$ & $26652$ & $0.302$ \\
+13 & $23413$ & $0.015$ & $17608$ & $0.633$ & $24789$ & $0.213$ \\
+14 & $23543$ & $0.013$ & $20784$ & $0.392$ & $23447$ & $0.342$ \\
+
+\hline
+\end{tabular}
+\end{center}
+
+Como os resíduos estão muito parecidos para todos os modelos, a melhor forma de avaliar seria com o RMSE e o RSQ, ou seja, os melhores modelos são com $k=6$ e $k=12$.
+
+
+# Modelos
+
+
+```{r}
+
+for(k in 0:5) {
+  #Preparação dos dados
+  covid <- read.csv('dados_covid.csv') %>%
+           select(-date)%>%      
+           mutate(dias = (15-k):(667-k))
+  
+  pesquisas <- read.csv('dados_pesquisas.csv') %>% 
+               filter(date > date('2020-02-11'))
+
+  k_dias <- lag(pesquisas, n=(15-k)) %>% 
+            na.omit() %>% 
+            mutate(dias=1:(674+k)) 
+
+  atraso <- full_join(covid, k_dias, by = 'dias') %>% 
+                select(-dias, -date) %>% 
+                na.omit()
+
+  summary(atraso)
+  
+  #Modelagem
+  
+  set.seed(123, kind = "Mersenne-Twister", normal.kind = "Inversion")
+  
+  #Separação dos dados entre treino e teste 
+  
+  #Utilizando apenas 7 dias para o teste
+  atraso_split <- initial_time_split(atraso, strata = covid, prop = .9893)
+  atraso_train <- training(atraso_split)
+  atraso_test <- testing(atraso_split)
+  
+  set.seed(234, kind = "Mersenne-Twister", normal.kind = "Inversion")
+  
+  #Fazendo os folds
+  atraso_folds <- vfold_cv(atraso_train, v = 5, strata = covid)
+  atraso_folds
+
+  #Modelo
+  ranger_recipe <-
+    recipe(formula = covid ~ ., data = atraso_train) #%>%
+  #step_normalize(all_predictors())
+  
+  ranger_spec <-
+    rand_forest(mtry = tune(), min_n = tune(), trees = tune()) %>%
+    set_mode("regression") %>%
+    set_engine("ranger")
+  
+  #grid de procura
+  atraso_grid <- grid_regular(mtry(range(1, 5)),
+                                 trees(range(500, 1000)),
+                                 min_n(range(10, 100)),
+                                 levels = c(2, 3, 10))
+  ranger_workflow <-
+    workflow() %>%
+    add_recipe(ranger_recipe) %>%
+    add_model(ranger_spec)
+  
+  set.seed(8577, kind = "Mersenne-Twister", normal.kind = "Inversion")
+  doParallel::registerDoParallel()
+  ranger_tune <-
+    tune_grid(ranger_workflow,
+              resamples = atraso_folds,
+              grid = atraso_grid
+    )
+  
+  print(paste("Modelo com k =", k))
+  
+  print(show_best(ranger_tune, metric = "rmse"))
+  
+  print(show_best(ranger_tune, metric = "rsq"))
+  
+  print(autoplot(ranger_tune))
+  
+  final_rf <- ranger_workflow %>%
+  finalize_workflow(select_best(ranger_tune))
+
+  final_rf
+
+  #A função last_fit() ajusta essa floresta aleatória finalizada 
+  #uma última vez aos dados de treinamento e avalia uma última 
+  #vez nos dados de teste.
+
+  dados_fit<- last_fit(final_rf, atraso_split)
+  dados_fit
+
+  print(collect_metrics(dados_fit))
+  
+  modelo <- predict(dados_fit$.workflow[[1]],atraso_train) %>% 
+            mutate(dias= 1:(646))
+  atraso <- atraso_train %>% 
+            mutate(dias= 1:(646))
+  
+  geral <- full_join(modelo, atraso, by = 'dias')
+  
+  print(ggplot(geral, aes(covid, .pred))+
+        geom_abline(lty = 2, color = "gray50") +
+        geom_point(alpha = 0.5, color = "midnightblue"))
+  
+  print(ggplot(geral)+
+        geom_line(aes(x = dias, y = covid, color = "Observado"))+
+        geom_line(aes(x = dias, y = .pred, color = "Predito"))+
+        scale_colour_manual(values = c("midnightblue", "yellow"))+
+        labs(title= paste("Modelo para os dados de treino com k =", k),
+             y="Número de casos"))
+      
+  modelo_k <- predict(dados_fit$.workflow[[1]], atraso_test) %>% 
+                    mutate(dias= 1:7)
+  atraso_k<- atraso_test %>% 
+             mutate(dias= 1:7)
+
+  geral_teste <- full_join(modelo_k, atraso_k, by = 'dias')
+
+  print(ggplot(geral_teste)+
+        geom_line(aes(x = dias, y = covid, color = "Observado"))+
+        geom_line(aes(x = dias, y = .pred, color = "Predito"))+
+        scale_colour_manual(values = c("midnightblue", "yellow"))+
+        labs(title= paste("Modelo com os dados de teste com k =", k),
+             y="Número de casos"))
+
+  imp_spec <- ranger_spec %>%
+    finalize_model(select_best(ranger_tune)) %>%
+    set_engine("ranger", importance = "permutation")
+
+  print(workflow() %>%
+        add_recipe(ranger_recipe) %>%
+        add_model(imp_spec) %>%
+        fit(atraso_train) %>%
+        pull_workflow_fit() %>%
+        vip(aesthetics = list(alpha = 0.8, fill = "midnightblue"),
+            scale = TRUE))   
+  #Métricas para os dados de treino
+  
+  print(paste("Métricas para os dados de treino com k =", k))
+  
+  resultado_dados_fit <-
+    atraso_train %>%
+    bind_cols(predict(dados_fit$.workflow[[1]], atraso_train) %>%
+                rename(predicao_dados_fit= .pred))
+
+
+  print(metrics(resultado_dados_fit,
+                truth = covid,
+                estimate = predicao_dados_fit,
+                options = "rmse"))
+  
+  #Métricas para os dados de teste 
+  
+  print(paste("Métricas para os dados de teste com k =", k))
+  
+  resultado_dados_fit <-
+    atraso_test %>%
+    bind_cols(predict(dados_fit$.workflow[[1]], atraso_test) %>%
+                rename(predicao_dados_fit= .pred))
+  
+  
+  print(metrics(resultado_dados_fit,
+                truth = covid,
+                estimate = predicao_dados_fit,
+                options = "rmse"))
+}
+
+
+
+```
+
+```{r}
+
+for(k in 6:10) {
+  #Preparação dos dados
+  covid <- read.csv('dados_covid.csv') %>%
+           select(-date)%>%      
+           mutate(dias = (15-k):(667-k))
+  
+  pesquisas <- read.csv('dados_pesquisas.csv') %>% 
+               filter(date > date('2020-02-11'))
+
+  k_dias <- lag(pesquisas, n=(15-k)) %>% 
+            na.omit() %>% 
+            mutate(dias=1:(674+k)) 
+
+  atraso <- full_join(covid, k_dias, by = 'dias') %>% 
+                select(-dias, -date) %>% 
+                na.omit()
+
+  summary(atraso)
+  
+  #Modelagem
+  
+  set.seed(123, kind = "Mersenne-Twister", normal.kind = "Inversion")
+  
+  #Separação dos dados entre treino e teste 
+  
+  #Utilizando apenas 7 dias para o teste
+  atraso_split <- initial_time_split(atraso, strata = covid, prop = .9893)
+  atraso_train <- training(atraso_split)
+  atraso_test <- testing(atraso_split)
+  
+  set.seed(234, kind = "Mersenne-Twister", normal.kind = "Inversion")
+  
+  #Fazendo os folds
+  atraso_folds <- vfold_cv(atraso_train, v = 5, strata = covid)
+  atraso_folds
+
+  #Modelo
+  ranger_recipe <-
+    recipe(formula = covid ~ ., data = atraso_train) #%>%
+  #step_normalize(all_predictors())
+  
+  ranger_spec <-
+    rand_forest(mtry = tune(), min_n = tune(), trees = tune()) %>%
+    set_mode("regression") %>%
+    set_engine("ranger")
+  
+  #grid de procura
+  atraso_grid <- grid_regular(mtry(range(1, 5)),
+                                 trees(range(500, 1000)),
+                                 min_n(range(10, 100)),
+                                 levels = c(2, 3, 10))
+  ranger_workflow <-
+    workflow() %>%
+    add_recipe(ranger_recipe) %>%
+    add_model(ranger_spec)
+  
+  set.seed(8577, kind = "Mersenne-Twister", normal.kind = "Inversion")
+  doParallel::registerDoParallel()
+  ranger_tune <-
+    tune_grid(ranger_workflow,
+              resamples = atraso_folds,
+              grid = atraso_grid
+    )
+  
+  print(paste("Modelo com k =", k))
+  
+  print(show_best(ranger_tune, metric = "rmse"))
+  
+  print(show_best(ranger_tune, metric = "rsq"))
+  
+  print(autoplot(ranger_tune))
+  
+  final_rf <- ranger_workflow %>%
+  finalize_workflow(select_best(ranger_tune))
+
+  final_rf
+
+  #A função last_fit() ajusta essa floresta aleatória finalizada 
+  #uma última vez aos dados de treinamento e avalia uma última 
+  #vez nos dados de teste.
+
+  dados_fit<- last_fit(final_rf, atraso_split)
+  dados_fit
+
+  print(collect_metrics(dados_fit))
+  
+  modelo <- predict(dados_fit$.workflow[[1]],atraso_train) %>% 
+            mutate(dias= 1:(646))
+  atraso <- atraso_train %>% 
+            mutate(dias= 1:(646))
+  
+  geral <- full_join(modelo, atraso, by = 'dias')
+  
+  print(ggplot(geral, aes(covid, .pred))+
+        geom_abline(lty = 2, color = "gray50") +
+        geom_point(alpha = 0.5, color = "midnightblue"))
+  
+  print(ggplot(geral)+
+        geom_line(aes(x = dias, y = covid, color = "Observado"))+
+        geom_line(aes(x = dias, y = .pred, color = "Predito"))+
+        scale_colour_manual(values = c("midnightblue", "yellow"))+
+        labs(title= paste("Modelo para os dados de treino com k =", k),
+             y="Número de casos"))
+      
+  modelo_k <- predict(dados_fit$.workflow[[1]], atraso_test) %>% 
+                    mutate(dias= 1:7)
+  atraso_k<- atraso_test %>% 
+             mutate(dias= 1:7)
+
+  geral_teste <- full_join(modelo_k, atraso_k, by = 'dias')
+
+  print(ggplot(geral_teste)+
+        geom_line(aes(x = dias, y = covid, color = "Observado"))+
+        geom_line(aes(x = dias, y = .pred, color = "Predito"))+
+        scale_colour_manual(values = c("midnightblue", "yellow"))+
+        labs(title= paste("Modelo com os dados de teste com k =", k),
+             y="Número de casos"))
+
+  imp_spec <- ranger_spec %>%
+    finalize_model(select_best(ranger_tune)) %>%
+    set_engine("ranger", importance = "permutation")
+
+  print(workflow() %>%
+        add_recipe(ranger_recipe) %>%
+        add_model(imp_spec) %>%
+        fit(atraso_train) %>%
+        pull_workflow_fit() %>%
+        vip(aesthetics = list(alpha = 0.8, fill = "midnightblue"),
+            scale = TRUE))   
+  #Métricas para os dados de treino
+  
+  print(paste("Métricas para os dados de treino com k =", k))
+  
+  resultado_dados_fit <-
+    atraso_train %>%
+    bind_cols(predict(dados_fit$.workflow[[1]], atraso_train) %>%
+                rename(predicao_dados_fit= .pred))
+
+
+  print(metrics(resultado_dados_fit,
+                truth = covid,
+                estimate = predicao_dados_fit,
+                options = "rmse"))
+  
+  #Métricas para os dados de teste 
+  
+  print(paste("Métricas para os dados de teste com k =", k))
+  
+  resultado_dados_fit <-
+    atraso_test %>%
+    bind_cols(predict(dados_fit$.workflow[[1]], atraso_test) %>%
+                rename(predicao_dados_fit= .pred))
+  
+  
+  print(metrics(resultado_dados_fit,
+                truth = covid,
+                estimate = predicao_dados_fit,
+                options = "rmse"))
+}
+
+```
+
+```{r}
+
+for(k in 11:14) {
+#Preparação dos dados
+  covid <- read.csv('dados_covid.csv') %>%
+           select(-date)%>%      
+           mutate(dias = (15-k):(667-k))
+  
+  pesquisas <- read.csv('dados_pesquisas.csv') %>% 
+               filter(date > date('2020-02-11'))
+
+  k_dias <- lag(pesquisas, n=(15-k)) %>% 
+            na.omit() %>% 
+            mutate(dias=1:(674+k)) 
+
+  atraso <- full_join(covid, k_dias, by = 'dias') %>% 
+                select(-dias, -date) %>% 
+                na.omit()
+
+  summary(atraso)
+  
+  #Modelagem
+  
+  set.seed(123, kind = "Mersenne-Twister", normal.kind = "Inversion")
+  
+  #Separação dos dados entre treino e teste 
+  
+  #Utilizando apenas 7 dias para o teste
+  atraso_split <- initial_time_split(atraso, strata = covid, prop = .9893)
+  atraso_train <- training(atraso_split)
+  atraso_test <- testing(atraso_split)
+  
+  set.seed(234, kind = "Mersenne-Twister", normal.kind = "Inversion")
+  
+  #Fazendo os folds
+  atraso_folds <- vfold_cv(atraso_train, v = 5, strata = covid)
+  atraso_folds
+
+  #Modelo
+  ranger_recipe <-
+    recipe(formula = covid ~ ., data = atraso_train) #%>%
+  #step_normalize(all_predictors())
+  
+  ranger_spec <-
+    rand_forest(mtry = tune(), min_n = tune(), trees = tune()) %>%
+    set_mode("regression") %>%
+    set_engine("ranger")
+  
+  #grid de procura
+  atraso_grid <- grid_regular(mtry(range(1, 5)),
+                                 trees(range(500, 1000)),
+                                 min_n(range(10, 100)),
+                                 levels = c(2, 3, 10))
+  ranger_workflow <-
+    workflow() %>%
+    add_recipe(ranger_recipe) %>%
+    add_model(ranger_spec)
+  
+  set.seed(8577, kind = "Mersenne-Twister", normal.kind = "Inversion")
+  doParallel::registerDoParallel()
+  ranger_tune <-
+    tune_grid(ranger_workflow,
+              resamples = atraso_folds,
+              grid = atraso_grid
+    )
+  
+  print(paste("Modelo com k =", k))
+  
+  print(show_best(ranger_tune, metric = "rmse"))
+  
+  print(show_best(ranger_tune, metric = "rsq"))
+  
+  print(autoplot(ranger_tune))
+  
+  final_rf <- ranger_workflow %>%
+  finalize_workflow(select_best(ranger_tune))
+
+  final_rf
+
+  #A função last_fit() ajusta essa floresta aleatória finalizada 
+  #uma última vez aos dados de treinamento e avalia uma última 
+  #vez nos dados de teste.
+
+  dados_fit<- last_fit(final_rf, atraso_split)
+  dados_fit
+
+  print(collect_metrics(dados_fit))
+
+  modelo <- predict(dados_fit$.workflow[[1]],atraso_train) %>% 
+            mutate(dias= 1:(646))
+  atraso <- atraso_train %>% 
+            mutate(dias= 1:(646))
+  
+  geral <- full_join(modelo, atraso, by = 'dias')
+  
+  print(ggplot(geral, aes(covid, .pred))+
+        geom_abline(lty = 2, color = "gray50") +
+        geom_point(alpha = 0.5, color = "midnightblue"))
+  
+  print(ggplot(geral)+
+        geom_line(aes(x = dias, y = covid, color = "Observado"))+
+        geom_line(aes(x = dias, y = .pred, color = "Predito"))+
+        scale_colour_manual(values = c("midnightblue", "yellow"))+
+        labs(title= paste("Modelo para os dados de treino com k =", k),
+             y="Número de casos"))
+      
+  modelo_k <- predict(dados_fit$.workflow[[1]], atraso_test) %>% 
+                    mutate(dias= 1:7)
+  atraso_k<- atraso_test %>% 
+             mutate(dias= 1:7)
+
+  geral_teste <- full_join(modelo_k, atraso_k, by = 'dias')
+
+  print(ggplot(geral_teste)+
+        geom_line(aes(x = dias, y = covid, color = "Observado"))+
+        geom_line(aes(x = dias, y = .pred, color = "Predito"))+
+        scale_colour_manual(values = c("midnightblue", "yellow"))+
+        labs(title= paste("Modelo com os dados de teste com k =", k),
+             y="Número de casos"))
+
+  imp_spec <- ranger_spec %>%
+    finalize_model(select_best(ranger_tune)) %>%
+    set_engine("ranger", importance = "permutation")
+
+  print(workflow() %>%
+        add_recipe(ranger_recipe) %>%
+        add_model(imp_spec) %>%
+        fit(atraso_train) %>%
+        pull_workflow_fit() %>%
+        vip(aesthetics = list(alpha = 0.8, fill = "midnightblue"),
+            scale = TRUE))   
+  #Métricas para os dados de treino
+  
+  print(paste("Métricas para os dados de treino com k =", k))
+  
+  resultado_dados_fit <-
+    atraso_train %>%
+    bind_cols(predict(dados_fit$.workflow[[1]], atraso_train) %>%
+                rename(predicao_dados_fit= .pred))
+
+
+  print(metrics(resultado_dados_fit,
+                truth = covid,
+                estimate = predicao_dados_fit,
+                options = "rmse"))
+  
+  #Métricas para os dados de teste 
+  
+  print(paste("Métricas para os dados de teste com k =", k))
+  
+  resultado_dados_fit <-
+    atraso_test %>%
+    bind_cols(predict(dados_fit$.workflow[[1]], atraso_test) %>%
+                rename(predicao_dados_fit= .pred))
+  
+  
+  print(metrics(resultado_dados_fit,
+                truth = covid,
+                estimate = predicao_dados_fit,
+                options = "rmse"))
+}
+
+```
